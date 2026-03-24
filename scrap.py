@@ -1,12 +1,17 @@
-from requests_html import HTMLSession
 from bs4 import BeautifulSoup
 from datetime import date, time
-import requests
+from time import sleep
+import requests, asyncio
 
-TARGETS = [
-    "/us/oh/kent",
-    "/us/ga/athens"
-]
+try:
+    # you can attach this to a discord bot to send pings if desired!
+    import discord
+except ImportError:
+    discord = None
+
+# Uses playwright to request a page that
+# uses JS to populate table data
+from playwright.async_api import async_playwright
 
 def get_current_temp(soup):
     span = soup.find("span", class_="wu-value wu-value-to")
@@ -17,12 +22,12 @@ def get_current_temp(soup):
 def get_sky_condition(soup):
     div = soup.find("div", class_="condition-icon small-6 medium-12 columns")
     p = div.find("p")
-    
+
     sky_condition = "Unknown"
 
     if p:
         sky_condition = p.text
-    
+
     print(f"Sky Condition -> {sky_condition}")
     return sky_condition
 
@@ -94,7 +99,7 @@ def fetch_base_data(html, data):
     base_soup = BeautifulSoup(html, "html.parser")
     div = base_soup.find("div", class_="region-content-main")
     data_soup = BeautifulSoup(div.decode_contents(), "html.parser")
-    
+
     if div:
         # nicely formatted HTML
         # print(div.prettify())
@@ -131,41 +136,106 @@ def extract_from_row(row):
     if len(inner_rows) < 1:
         return "Unknown"
 
-    return inner_rows[0].decode_contents()
+    content = inner_rows[0].decode_contents()
 
-def get_temp_range(url):
+    if len(content) > 0:
+        return content
+    else:
+        return "Unknown"
+
+def is_int(value):
+    try:
+        int(value)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+async def extract_temps_from_page(page, url: str):
     min_temp = max_temp = "Unknown"
 
-    session = HTMLSession()
+    try:
+        await page.goto(url, timeout=120000)
+        await page.wait_for_load_state("networkidle")
 
-    attempts = 0
+        body_text = await page.inner_text("body")
+        if "No data recorded" in body_text:
+            return min_temp, max_temp
 
-    while attempts < 50 and min_temp == "Unknown" and max_temp == "Unknown":
-        attempts += 1
+        await page.wait_for_selector("text=High Temp", timeout=30000)
 
-        print("[*] Rendering Tables. . .")
-        r = session.get(url)
-        r.html.render(timeout=20)
+        html = await page.content()
+        soup = BeautifulSoup(html, "html.parser")
 
-        almanac_soup = BeautifulSoup(r.html.html, "html.parser")
-        data_table = almanac_soup.find("div", class_="summary-table")
-
+        data_table = soup.find("div", class_="summary-table")
         if data_table:
             table = data_table.find("table")
+            if table:
+                rows = table.find_all("tr")
+                if rows and len(rows) > 2:
+                    min_temp = extract_from_row(rows[2])
+                    max_temp = extract_from_row(rows[1])
 
-            if not table:
-                continue
+        return min_temp, max_temp
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return min_temp, max_temp
 
-            rows = table.find_all("tr")
-            if rows and len(rows) > 2:
-                attempts = 0
-                min_temp = extract_from_row(rows[2])
-                max_temp = extract_from_row(rows[1])
-    
-    print("[+] Captured Temperatures")
-    return min_temp, max_temp
 
-def get_todays_data(location:str):
+async def get_temp_range(url: str, channel=None):
+    print("[*] Attempting to fetch min/max temperatures...")
+
+    # discord is not needed to run these methods
+    if discord is None:
+        channel = None
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+
+        # create n number of tabs in attempt to find the data we need
+        MAX_TABS = 10
+        pages = [await browser.new_page() for _ in range(MAX_TABS)]
+
+        tasks = [
+            asyncio.create_task(extract_temps_from_page(page, url))
+            for page in pages
+        ]
+
+        try:
+            for task in asyncio.as_completed(tasks):
+                min_temp, max_temp = await task
+
+                if is_int(min_temp) and is_int(max_temp):
+                    print("[+] Captured Temperatures")
+                    print(f" |--- min_temp ({min_temp}) | max_temp ({max_temp})")
+
+                    # Cancel remaining tasks
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+
+                    return min_temp, max_temp
+
+            print(f"[-] Could not find temperatures at: {url}")
+            if channel:
+                await channel.send("Could not locate min/max temperatures. . .")
+            return "Unknown", "Unknown"
+        except Exception as e:
+            if channel:
+                await channel.send("Something went horribly wrong!")
+        finally:
+            # Ensure pages are closed
+            for page in pages:
+                await page.close()
+
+            await browser.close()
+
+# main exported function that is used
+async def get_todays_data(location:str, channel=None):
+    # discord is not needed to run these methods
+    if discord is None:
+        channel = None
+
     data = {
         "current_temp":"",
         "precipitation":"",
@@ -177,36 +247,54 @@ def get_todays_data(location:str):
         "sky":""
     }
 
-    weather_url = f"https://www.wunderground.com/weather/{location}"
+    try:
+        weather_url = f"https://www.wunderground.com/weather/{location}"
 
-    r = requests.get(weather_url);
+        r = requests.get(weather_url)
 
-    if r.status_code == 200:
-        # fetch data from website
-        fetch_base_data(r.text, data)
-    else:
-        err = "[-] Could not connect to weather-site!"
-        print(err)
-        return
+        if r.status_code == 200:
+            # fetch data from website
+            fetch_base_data(r.text, data)
+        else:
+            err = "[-] Could not connect to weather-site!"
+            if channel:
+                await channel.send(f"Error connecting to --> {weather_url}")
+            print(err)
+            return data
 
-    print(f"[*] Spidering to almanac url")
-    almanac_url = find_almanac_url(r.text)
+        # some feedback
+        if channel:
+            await channel.send("Searching for Almanac URL. . .")
 
-    if "http" in almanac_url:
-        data["min_temp"], data["max_temp"] = get_temp_range(almanac_url)
-    else:
-        print("[-] Could not find Almanac url")
+        print(f"[*] Spidering to almanac url")
+        almanac_url = find_almanac_url(r.text)
+        
+        if channel:
+            await channel.send(f"Found Almanac URL -> {almanac_url}")
 
-    print(f"Low  Temp -> {data['min_temp']}")
-    print(f"High Temp -> {data['max_temp']}")
+        if "http" in almanac_url:
+            # ensure we always get the temperature
+            attempts = 0
+            while attempts < 10:
+                data["min_temp"], data["max_temp"] = await get_temp_range(almanac_url, channel)
+                if is_int(data["min_temp"]) and is_int(data["max_temp"]):
+                    break
+                attempts += 1
+        else:
+            print("[-] Could not find Almanac url")
+
+        # some times the current temperature is higher than the max temperature found in the almanac
+        if int(data['max_temp']) < int(data['current_temp']):
+            data['max_temp'] = data['current_temp']
+
+        print(f"Low  Temp -> {data['min_temp']}")
+        print(f"High Temp -> {data['max_temp']}")
+        
+        print("I finished capturing today's weather data!")
+    except Exception as e:
+        # something went horribly wrong
+        if channel:
+            await channel.send(f"(EXCEPTION)[get todays data] --> ```\n{e}\n```")
+        print(f"(EXCEPTION): {e}")
 
     return data
-
-def main():
-    for target in TARGETS:
-        print(f"Getting Weather Information for -> {target}")
-        data = get_todays_data(target)
-        print("")
-
-if __name__ == "__main__":
-    main()
